@@ -1,22 +1,32 @@
 //SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.4;
+pragma solidity 0.8.16;
 
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Snapshot.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
 
 import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
 
-contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
+interface IPinkAntiBot {
+  function setTokenOwner(address owner) external;
 
-    using SafeMath for uint256;
+  function onPreTransferCheck(
+    address from,
+    address to,
+    uint256 amount
+  ) external;
+}
+
+contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable {
+
+    IPinkAntiBot public pinkAntiBot;
+    bool public antiBotEnabled;
+
     using Address for address;
     using SafeERC20 for IERC20;
 
@@ -86,7 +96,14 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
         inSwapAndLiquify = false;
     }    
 
-    constructor() ERC20("RewardDAO", "RDAO") {
+    constructor(address pinkAntiBot_) ERC20("RewardDAO", "RDAO") {
+
+        // Create an instance of the PinkAntiBot variable from the provided address
+        pinkAntiBot = IPinkAntiBot(pinkAntiBot_);
+        // Register the deployer to be the token owner with PinkAntiBot. You can
+        // later change the token owner in the PinkAntiBot contract
+        pinkAntiBot.setTokenOwner(msg.sender);
+        antiBotEnabled = true;
 
         _isExcludedFromFee[owner()] = true;
         _isExcludedFromFee[address(this)] = true;
@@ -108,6 +125,10 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
         uniswapV2Router = _uniswapV2Router;
     }
 
+    function setEnableAntiBot(bool _enable) external onlyOwner {
+        antiBotEnabled = _enable;
+    }
+
     function _transfer(
         address from,
         address to,
@@ -116,6 +137,9 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
         
         require(from != address(0), "ERC20: transfer from the zero address");
         require(to != address(0), "ERC20: transfer to the zero address");
+        if (antiBotEnabled) { 
+            pinkAntiBot.onPreTransferCheck(from, to, amount); 
+        }
 
         _beforeTokenTransfer(from, to, amount);
 
@@ -202,8 +226,13 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
 
     // Set Claim Round
     function setClaimRound(address _token) public onlyOwner returns (bool) {
+        require(_token != address(0), "setClaimRound: Claim Round Token is the zero address");
         uint256 _currentRound = _getCurrentSnapshotId();
-        require(_currentRound > 0, "ERC20Snapshot: id is 0");       
+        require(_currentRound > 0, "ERC20Snapshot: id is 0");
+        if (_currentRound > 1) {
+            uint256 prevRound = _currentRound - 1;
+            require(rounds[prevRound] == address(0), "setClaimRound: Previous Claim Round should be finished");
+        }
         rounds[_currentRound] = _token;
         claimedToken = _token;
         IERC20 _claimedToken = IERC20(claimedToken);
@@ -237,7 +266,7 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
     }
 
     // Claim
-    function claimCurrentRound() public returns (bool) {
+    function claimCurrentRound() external returns (bool) {
         require(claimedToken != address(0), "Claim disabled");
         address _holder = _msgSender();
         uint256 _currentRound = _getCurrentSnapshotId();
@@ -292,7 +321,6 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
         address[] memory path = new address[](2);
         path[0] = tokenAddress;
         path[1] = uniswapV2Router.WETH();
-
         if (tokenAmount == 0) tokenAmount = IERC20(tokenAddress).balanceOf(address(this));
         IERC20(tokenAddress).approve(address(uniswapV2Router), tokenAmount);
         // make the swap
@@ -317,14 +345,6 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
         _snapshot();
     }
 
-    function pause() public onlyOwner {
-        _pause();
-    }
-
-    function unpause() public onlyOwner {
-        _unpause();
-    }
-
     /* OVERRIDE */
 
     function renounceOwnership() public virtual onlyOwner override {
@@ -341,7 +361,6 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
 
     function _beforeTokenTransfer(address from, address to, uint256 amount)
         internal
-        whenNotPaused
         override(ERC20, ERC20Snapshot)
     {
         super._beforeTokenTransfer(from, to, amount);
@@ -357,23 +376,29 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
     }
 
     function setMinTokensBeforeSwap(uint256 _minTokensBeforeSwap) public onlyOwner {
+        require(_minTokensBeforeSwap > 0, 'Must be more than zero');
         minTokensBeforeSwap = _minTokensBeforeSwap * 10 ** _decimals;
     }
 
     function setMaxTxAmount(uint256 amount) public onlyOwner {
+        require(amount > 0, 'Must be more than zero');
         _maxTxAmount = amount * 10 ** _decimals;
     }
 
     function setMinClaimAmount(uint256 amount) public onlyOwner {
+        require(amount > 0, 'Must be more than zero');
         minTokensAllowClaim = amount * 10 ** _decimals;
     }    
 
-    function withdrawTokensFromBalance() public onlyOwner {
-        uint256 contractTokenBalance = balanceOf(address(this));
-        _transfer(address(this), _msgSender(), contractTokenBalance);
+    function withdrawTokensFromBalance(address _token) public onlyOwner {
+        require(_token != address(0), "withdrawTokensFromBalance: Token is the zero address");
+        require(_token != address(this), "withdrawTokensFromBalance: Token is Native Contract Token");        
+        IERC20 withdrawToken = IERC20(_token);
+        uint256 tokenBalance = withdrawToken.balanceOf(address(this));
+        if(tokenBalance > 0) withdrawToken.safeTransfer(msg.sender, tokenBalance);
     }
 
-    function isExcludedFromFee(address account) public view returns(bool) {
+    function isExcludedFromFee(address account) external view returns(bool) {
         return _isExcludedFromFee[account];
     }
     
@@ -386,6 +411,7 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
     }
 
     function setTaxes(uint256 newrewardFee, uint256 newmarketingFee, uint256 newnftFee, uint256 newburnFee) public onlyOwner {
+        require((newrewardFee + newmarketingFee + newnftFee + newburnFee) < 25, "Exceed Fee Limits of 25%");
         _rewardFee = newrewardFee;
         _marketingFee = newmarketingFee;
         _nftFee = newnftFee;
@@ -393,6 +419,9 @@ contract RewardDAO is ERC20, ERC20Burnable, ERC20Snapshot, Ownable, Pausable {
     }
 
     function setRewardWallets(address _rewardAddress, address _marketingAddress, address _nfttokenAddress) public onlyOwner {
+        require(_rewardAddress != address(0), "setRewardWallets: rewardAddress is the zero address");
+        require(_marketingAddress != address(0), "setRewardWallets: marketingAddress is the zero address");
+        require(_nfttokenAddress != address(0), "setRewardWallets: nfttokenAddress is the zero address");
         rewardAddress = payable(_rewardAddress);
         marketingAddress = payable(_marketingAddress);
         nfttokenAddress = payable(_nfttokenAddress);
